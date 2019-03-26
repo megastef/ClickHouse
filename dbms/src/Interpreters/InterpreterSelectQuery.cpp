@@ -55,6 +55,9 @@
 #include <ext/map.h>
 #include <memory>
 
+#include <Processors/NullSource.h>
+#include <Processors/Transforms/FilterTransform.h>
+
 
 namespace DB
 {
@@ -291,6 +294,13 @@ BlockInputStreams InterpreterSelectQuery::executeWithMultipleStreams()
     Pipeline pipeline;
     executeImpl(pipeline, input, only_analyze);
     return pipeline.streams;
+}
+
+QueryPipeline InterpreterSelectQuery::executeWithProcessors()
+{
+    QueryPipeline query_pipeline;
+    executeImpl(query_pipeline, input, only_analyze);
+    return query_pipeline;
 }
 
 InterpreterSelectQuery::AnalysisResult InterpreterSelectQuery::analyzeExpressions(QueryProcessingStage::Enum from_stage, bool dry_run)
@@ -559,6 +569,269 @@ void InterpreterSelectQuery::executeImpl(Pipeline & pipeline, const BlockInputSt
                 if (join.kind == ASTTableJoin::Kind::Full || join.kind == ASTTableJoin::Kind::Right)
                     pipeline.stream_with_non_joined_data = expressions.before_join->createStreamWithNonJoinedDataIfFullOrRightJoin(
                         pipeline.firstStream()->getHeader(), settings.max_block_size);
+
+                for (auto & stream : pipeline.streams)   /// Applies to all sources except stream_with_non_joined_data.
+                    stream = std::make_shared<ExpressionBlockInputStream>(stream, expressions.before_join);
+            }
+
+            if (expressions.has_where)
+                executeWhere(pipeline, expressions.before_where, expressions.remove_where_filter);
+
+            if (expressions.need_aggregate)
+                executeAggregation(pipeline, expressions.before_aggregation, aggregate_overflow_row, aggregate_final);
+            else
+            {
+                executeExpression(pipeline, expressions.before_order_and_select);
+                executeDistinct(pipeline, true, expressions.selected_columns);
+            }
+
+            /** For distributed query processing,
+              *  if no GROUP, HAVING set,
+              *  but there is an ORDER or LIMIT,
+              *  then we will perform the preliminary sorting and LIMIT on the remote server.
+              */
+            if (!expressions.second_stage && !expressions.need_aggregate && !expressions.has_having)
+            {
+                if (expressions.has_order_by)
+                    executeOrder(pipeline);
+
+                if (expressions.has_order_by && query.limit_length)
+                    executeDistinct(pipeline, false, expressions.selected_columns);
+
+                if (query.limit_length)
+                    executePreLimit(pipeline);
+            }
+
+            // If there is no global subqueries, we can run subqueries only when receive them on server.
+            if (!query_analyzer->hasGlobalSubqueries() && !expressions.subqueries_for_sets.empty())
+                executeSubqueriesInSetsAndJoins(pipeline, expressions.subqueries_for_sets);
+        }
+
+        if (expressions.second_stage)
+        {
+            bool need_second_distinct_pass = false;
+            bool need_merge_streams = false;
+
+            if (expressions.need_aggregate)
+            {
+                /// If you need to combine aggregated results from multiple servers
+                if (!expressions.first_stage)
+                    executeMergeAggregated(pipeline, aggregate_overflow_row, aggregate_final);
+
+                if (!aggregate_final)
+                {
+                    if (query.group_by_with_totals)
+                    {
+                        bool final = !query.group_by_with_rollup && !query.group_by_with_cube;
+                        executeTotalsAndHaving(pipeline, expressions.has_having, expressions.before_having, aggregate_overflow_row, final);
+                    }
+
+                    if (query.group_by_with_rollup)
+                        executeRollupOrCube(pipeline, Modificator::ROLLUP);
+                    else if (query.group_by_with_cube)
+                        executeRollupOrCube(pipeline, Modificator::CUBE);
+
+                    if ((query.group_by_with_rollup || query.group_by_with_cube) && expressions.has_having)
+                    {
+                        if (query.group_by_with_totals)
+                            throw Exception("WITH TOTALS and WITH ROLLUP or CUBE are not supported together in presence of HAVING", ErrorCodes::NOT_IMPLEMENTED);
+                        executeHaving(pipeline, expressions.before_having);
+                    }
+                }
+                else if (expressions.has_having)
+                    executeHaving(pipeline, expressions.before_having);
+
+                executeExpression(pipeline, expressions.before_order_and_select);
+                executeDistinct(pipeline, true, expressions.selected_columns);
+
+                need_second_distinct_pass = query.distinct && pipeline.hasMoreThanOneStream();
+            }
+            else
+            {
+                need_second_distinct_pass = query.distinct && pipeline.hasMoreThanOneStream();
+
+                if (query.group_by_with_totals && !aggregate_final)
+                {
+                    bool final = !query.group_by_with_rollup && !query.group_by_with_cube;
+                    executeTotalsAndHaving(pipeline, expressions.has_having, expressions.before_having, aggregate_overflow_row, final);
+                }
+
+                if ((query.group_by_with_rollup || query.group_by_with_cube) && !aggregate_final)
+                {
+                    if (query.group_by_with_rollup)
+                        executeRollupOrCube(pipeline, Modificator::ROLLUP);
+                    else if (query.group_by_with_cube)
+                        executeRollupOrCube(pipeline, Modificator::CUBE);
+
+                    if (expressions.has_having)
+                    {
+                        if (query.group_by_with_totals)
+                            throw Exception("WITH TOTALS and WITH ROLLUP or CUBE are not supported together in presence of HAVING", ErrorCodes::NOT_IMPLEMENTED);
+                        executeHaving(pipeline, expressions.before_having);
+                    }
+                }
+            }
+
+            if (expressions.has_order_by)
+            {
+                /** If there is an ORDER BY for distributed query processing,
+                  *  but there is no aggregation, then on the remote servers ORDER BY was made
+                  *  - therefore, we merge the sorted streams from remote servers.
+                  */
+                if (!expressions.first_stage && !expressions.need_aggregate && !(query.group_by_with_totals && !aggregate_final))
+                    executeMergeSorted(pipeline);
+                else    /// Otherwise, just sort.
+                    executeOrder(pipeline);
+            }
+
+            /** Optimization - if there are several sources and there is LIMIT, then first apply the preliminary LIMIT,
+              * limiting the number of rows in each up to `offset + limit`.
+              */
+            if (query.limit_length && pipeline.hasMoreThanOneStream() && !query.distinct && !expressions.has_limit_by && !settings.extremes)
+            {
+                executePreLimit(pipeline);
+            }
+
+            if (need_second_distinct_pass
+                || query.limit_length
+                || query.limit_by_expression_list
+                || pipeline.stream_with_non_joined_data)
+            {
+                need_merge_streams = true;
+            }
+
+            if (need_merge_streams)
+                executeUnion(pipeline);
+
+            /** If there was more than one stream,
+              * then DISTINCT needs to be performed once again after merging all streams.
+              */
+            if (need_second_distinct_pass)
+                executeDistinct(pipeline, false, expressions.selected_columns);
+
+            if (expressions.has_limit_by)
+            {
+                executeExpression(pipeline, expressions.before_limit_by);
+                executeLimitBy(pipeline);
+            }
+
+            /** We must do projection after DISTINCT because projection may remove some columns.
+              */
+            executeProjection(pipeline, expressions.final_projection);
+
+            /** Extremes are calculated before LIMIT, but after LIMIT BY. This is Ok.
+              */
+            executeExtremes(pipeline);
+
+            executeLimit(pipeline);
+        }
+    }
+
+    if (query_analyzer->hasGlobalSubqueries() && !expressions.subqueries_for_sets.empty())
+        executeSubqueriesInSetsAndJoins(pipeline, expressions.subqueries_for_sets);
+}
+
+void InterpreterSelectQuery::executeImpl(QueryPipeline & pipeline, const BlockInputStreamPtr & prepared_input, bool dry_run)
+{
+    /** Streams of data. When the query is executed in parallel, we have several data streams.
+     *  If there is no GROUP BY, then perform all operations before ORDER BY and LIMIT in parallel, then
+     *  if there is an ORDER BY, then glue the streams using UnionBlockInputStream, and then MergeSortingBlockInputStream,
+     *  if not, then glue it using UnionBlockInputStream,
+     *  then apply LIMIT.
+     *  If there is GROUP BY, then we will perform all operations up to GROUP BY, inclusive, in parallel;
+     *  a parallel GROUP BY will glue streams into one,
+     *  then perform the remaining operations with one resulting stream.
+     */
+
+    const Settings & settings = context.getSettingsRef();
+
+    QueryProcessingStage::Enum from_stage = QueryProcessingStage::FetchColumns;
+
+    /// PREWHERE optimization
+    if (storage)
+    {
+        if (!dry_run)
+            from_stage = storage->getQueryProcessingStage(context);
+
+        query_analyzer->makeSetsForIndex();
+
+        auto optimize_prewhere = [&](auto & merge_tree)
+        {
+            SelectQueryInfo query_info;
+            query_info.query = query_ptr;
+            query_info.syntax_analyzer_result = syntax_analyzer_result;
+            query_info.sets = query_analyzer->getPreparedSets();
+
+            /// Try transferring some condition from WHERE to PREWHERE if enabled and viable
+            if (settings.optimize_move_to_prewhere && query.where_expression && !query.prewhere_expression && !query.final())
+                MergeTreeWhereOptimizer{query_info, context, merge_tree.getData(), query_analyzer->getRequiredSourceColumns(), log};
+        };
+
+        if (const StorageMergeTree * merge_tree = dynamic_cast<const StorageMergeTree *>(storage.get()))
+            optimize_prewhere(*merge_tree);
+        else if (const StorageReplicatedMergeTree * replicated_merge_tree = dynamic_cast<const StorageReplicatedMergeTree *>(storage.get()))
+            optimize_prewhere(*replicated_merge_tree);
+    }
+
+    AnalysisResult expressions;
+
+    if (dry_run)
+    {
+        pipeline.init({std::make_shared<NullSource>(source_header)});
+        expressions = analyzeExpressions(QueryProcessingStage::FetchColumns, true);
+
+        if (expressions.prewhere_info)
+            pipeline.addSimpleTransform([&](const Block & header) {
+                return std::make_shared<FilterTransform>(
+                        header,
+                        expressions.prewhere_info->prewhere_actions,
+                        expressions.prewhere_info->prewhere_column_name,
+                        expressions.prewhere_info->remove_prewhere_column);
+            });
+    }
+    else
+    {
+        if (prepared_input)
+            pipeline.streams.push_back(prepared_input);
+
+        expressions = analyzeExpressions(from_stage, false);
+
+        if (from_stage == QueryProcessingStage::WithMergeableState &&
+            to_stage == QueryProcessingStage::WithMergeableState)
+            throw Exception("Distributed on Distributed is not supported", ErrorCodes::NOT_IMPLEMENTED);
+
+        /** Read the data from Storage. from_stage - to what stage the request was completed in Storage. */
+        executeFetchColumns(from_stage, pipeline, expressions.prewhere_info, expressions.columns_to_remove_after_prewhere);
+
+        LOG_TRACE(log, QueryProcessingStage::toString(from_stage) << " -> " << QueryProcessingStage::toString(to_stage));
+    }
+
+    if (to_stage > QueryProcessingStage::FetchColumns)
+    {
+        /// Now we will compose block streams that perform the necessary actions.
+
+        /// Do I need to aggregate in a separate row rows that have not passed max_rows_to_group_by.
+        bool aggregate_overflow_row =
+                expressions.need_aggregate &&
+                query.group_by_with_totals &&
+                settings.max_rows_to_group_by &&
+                settings.group_by_overflow_mode == OverflowMode::ANY &&
+                settings.totals_mode != TotalsMode::AFTER_HAVING_EXCLUSIVE;
+
+        /// Do I need to immediately finalize the aggregate functions after the aggregation?
+        bool aggregate_final =
+                expressions.need_aggregate &&
+                to_stage > QueryProcessingStage::WithMergeableState &&
+                !query.group_by_with_totals && !query.group_by_with_rollup && !query.group_by_with_cube;
+
+        if (expressions.first_stage)
+        {
+            if (expressions.hasJoin())
+            {
+                const ASTTableJoin & join = static_cast<const ASTTableJoin &>(*query.join()->table_join);
+                if (join.kind == ASTTableJoin::Kind::Full || join.kind == ASTTableJoin::Kind::Right)
+                    pipeline.stream_with_non_joined_data = expressions.before_join->createStreamWithNonJoinedDataIfFullOrRightJoin(
+                            pipeline.firstStream()->getHeader(), settings.max_block_size);
 
                 for (auto & stream : pipeline.streams)   /// Applies to all sources except stream_with_non_joined_data.
                     stream = std::make_shared<ExpressionBlockInputStream>(stream, expressions.before_join);

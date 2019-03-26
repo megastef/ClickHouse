@@ -10,6 +10,7 @@
 #include <DataStreams/IBlockInputStream.h>
 #include <Storages/SelectQueryInfo.h>
 
+#include <Processors/QueryPipeline.h>
 
 namespace Poco { class Logger; }
 
@@ -77,6 +78,8 @@ public:
 
     /// Execute the query and return multuple streams for parallel processing.
     BlockInputStreams executeWithMultipleStreams();
+    
+    QueryPipeline executeWithProcessors();
 
     Block getSampleBlock();
 
@@ -129,6 +132,7 @@ private:
 
     void executeImpl(Pipeline & pipeline, const BlockInputStreamPtr & prepared_input, bool dry_run);
 
+    void executeImpl(QueryPipeline & pipeline, const BlockInputStreamPtr & prepared_input, bool dry_run);
 
     struct AnalysisResult
     {
