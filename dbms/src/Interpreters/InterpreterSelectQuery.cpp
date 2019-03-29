@@ -63,6 +63,9 @@
 #include <Processors/Transforms/MergingAggregatedTransform.h>
 #include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
 #include <Processors/Transforms/TotalsHavingTransform.h>
+#include <Processors/Transforms/PartialSortingTransform.h>
+#include <Processors/Transforms/LimitsCheckingTransform.h>
+#include <Processors/Transforms/MergeSortingTransform.h>
 
 
 namespace DB
@@ -1906,6 +1909,14 @@ void InterpreterSelectQuery::executeHaving(Pipeline & pipeline, const Expression
     });
 }
 
+void InterpreterSelectQuery::executeHaving(QueryPipeline & pipeline, const ExpressionActionsPtr & expression)
+{
+    pipeline.addSimpleTransform([&](const Block & header)
+    {
+        return std::make_shared<FilterTransform>(header, expression, query.having_expression->getColumnName());
+    });
+}
+
 
 void InterpreterSelectQuery::executeTotalsAndHaving(Pipeline & pipeline, bool has_having, const ExpressionActionsPtr & expression, bool overflow_row, bool final)
 {
@@ -1970,6 +1981,13 @@ void InterpreterSelectQuery::executeExpression(Pipeline & pipeline, const Expres
     });
 }
 
+void InterpreterSelectQuery::executeExpression(QueryPipeline & pipeline, const ExpressionActionsPtr & expression)
+{
+    pipeline.addSimpleTransform([&](const Block & header)
+    {
+        return std::make_shared<ExpressionTransform>(header, expression);
+    });
+}
 
 static SortDescription getSortDescription(ASTSelectQuery & query)
 {
@@ -2019,6 +2037,37 @@ void InterpreterSelectQuery::executeOrder(Pipeline & pipeline)
         pipeline.firstStream(), order_descr, settings.max_block_size, limit,
         settings.max_bytes_before_remerge_sort,
         settings.max_bytes_before_external_sort, context.getTemporaryPath());
+}
+
+void InterpreterSelectQuery::executeOrder(QueryPipeline & pipeline)
+{
+    SortDescription order_descr = getSortDescription(query);
+    UInt64 limit = getLimitForSorting(query, context);
+
+    const Settings & settings = context.getSettingsRef();
+
+    /// TODO: Limits on sorting
+//    IBlockInputStream::LocalLimits limits;
+//    limits.mode = IBlockInputStream::LIMITS_TOTAL;
+//    limits.size_limits = SizeLimits(settings.max_rows_to_sort, settings.max_bytes_to_sort, settings.sort_overflow_mode);
+
+
+    pipeline.addSimpleTransform([&](const Block & header)
+    {
+        return std::make_shared<PartialSortingTransform>(header, order_descr, limit);
+    });
+
+    /// If there are several streams, we merge them into one
+    pipeline.resize(1);
+
+    /// Merge the sorted blocks.
+    pipeline.addSimpleTransform([&](const Block & header)
+    {
+        return std::make_shared<MergeSortingTransform>(
+                header, order_descr, settings.max_block_size, limit,
+                settings.max_bytes_before_remerge_sort,
+                settings.max_bytes_before_external_sort, context.getTemporaryPath());
+    });
 }
 
 
