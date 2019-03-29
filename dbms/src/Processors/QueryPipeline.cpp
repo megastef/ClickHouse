@@ -1,7 +1,11 @@
 #include <Processors/QueryPipeline.h>
+
+#include <Processors/ResizeProcessor.h>
+#include <Processors/ConcatProcessor.h>
+#include <Processors/Transforms/TotalsHavingTransform.h>
+
 #include <IO/WriteHelpers.h>
-#include "ResizeProcessor.h"
-#include "ConcatProcessor.h"
+#include <Common/typeid_cast.h>
 
 namespace DB
 {
@@ -172,6 +176,27 @@ void QueryPipeline::resize(size_t num_streams)
     streams.reserve(num_streams);
     for (auto & output : resize->getOutputs())
         streams.emplace_back(&output);
+}
+
+void QueryPipeline::addTotalsHavingTransform(ProcessorPtr transform)
+{
+    checkInitialized();
+
+    if (!typeid_cast<const TotalsHavingTransform *>(transform.get()))
+        throw Exception("TotalsHavingTransform expected for QueryPipeline::addTotalsHavingTransform.",
+                ErrorCodes::LOGICAL_ERROR);
+
+    if (has_totals_having)
+        throw Exception("Totals having transform was already added to pipeline.", ErrorCodes::LOGICAL_ERROR);
+
+    has_totals_having = true;
+
+    resize(1);
+
+    connect(*streams.front(), transform->getInputs().front());
+    auto & outputs = transform->getOutputs();
+    streams = { &outputs.front(), &outputs.back() };
+    processors.emplace_back(std::move(transform));
 }
 
 

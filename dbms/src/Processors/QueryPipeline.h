@@ -21,6 +21,7 @@ public:
 
     void addSimpleTransform(ProcessorGetter getter);
     void addPipe(Processors pipe);
+    void addTotalsHavingTransform(ProcessorPtr transform);
 
     /// Will read from this stream after all data was read from other streams.
     void addDelayedStream(ProcessorPtr source);
@@ -48,6 +49,7 @@ private:
     TableStructureReadLocks table_locks;
 
     bool has_delayed_stream = false;
+    bool has_totals_having = false;
 
     void checkInitialized();
     void checkSource(const ProcessorPtr & source);

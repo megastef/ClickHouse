@@ -62,6 +62,7 @@
 #include <Processors/Transforms/AggregatingTransform.h>
 #include <Processors/Transforms/MergingAggregatedTransform.h>
 #include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
+#include <Processors/Transforms/TotalsHavingTransform.h>
 
 
 namespace DB
@@ -1917,15 +1918,16 @@ void InterpreterSelectQuery::executeTotalsAndHaving(Pipeline & pipeline, bool ha
         has_having ? query.having_expression->getColumnName() : "", settings.totals_mode, settings.totals_auto_threshold, final);
 }
 
-void InterpreterSelectQuery::executeTotalsAndHaving(Pipeline & pipeline, bool has_having, const ExpressionActionsPtr & expression, bool overflow_row, bool final)
+void InterpreterSelectQuery::executeTotalsAndHaving(QueryPipeline & pipeline, bool has_having, const ExpressionActionsPtr & expression, bool overflow_row, bool final)
 {
-    executeUnion(pipeline);
-
     const Settings & settings = context.getSettingsRef();
 
-    pipeline.firstStream() = std::make_shared<TotalsHavingBlockInputStream>(
-            pipeline.firstStream(), overflow_row, expression,
-            has_having ? query.having_expression->getColumnName() : "", settings.totals_mode, settings.totals_auto_threshold, final);
+    auto totals_having = std::make_shared<TotalsHavingTransform>(
+            pipeline.getHeader(), overflow_row, expression,
+            has_having ? query.having_expression->getColumnName() : "",
+            settings.totals_mode, settings.totals_auto_threshold, final);
+
+    pipeline.addTotalsHavingTransform(std::move(totals_having));
 }
 
 
