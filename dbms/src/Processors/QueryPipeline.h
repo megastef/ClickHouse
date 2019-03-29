@@ -20,6 +20,7 @@ public:
     using ProcessorGetter = std::function<ProcessorPtr(const Block & header)>;
 
     void addSimpleTransform(ProcessorGetter getter);
+    void addPipe(Processors pipe);
 
     /// Will read from this stream after all data was read from other streams.
     void addDelayedStream(ProcessorPtr source);

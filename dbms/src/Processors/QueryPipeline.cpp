@@ -82,6 +82,44 @@ void QueryPipeline::addSimpleTransform(ProcessorGetter getter)
     current_header = std::move(header);
 }
 
+void QueryPipeline::addPipe(Processors pipe)
+{
+    checkInitialized();
+    concatDelayedStream();
+
+    if (pipe.empty())
+        throw Exception("Can't add empty processors list to QueryPipeline.", ErrorCodes::LOGICAL_ERROR);
+
+    auto & first = pipe.front();
+    auto & last = pipe.back();
+
+    auto num_inputs = first->getInputs().size();
+
+    if (num_inputs != streams.size())
+        throw Exception("Can't add processors to QueryPipeline because first processor has " + toString(num_inputs) +
+                        " input ports, but QueryPipeline has " + toString(streams.size()) + " streams.",
+                        ErrorCodes::LOGICAL_ERROR);
+
+    auto stream = streams.begin();
+    for (auto & input : first->getInputs())
+        connect(**(stream++), input);
+
+    Block header;
+    streams.clear();
+    streams.reserve(last->getOutputs().size());
+    for (auto & output : last->getOutputs())
+    {
+        streams.emplace_back(&output);
+        if (header)
+            assertBlocksHaveEqualStructure(header, output.getHeader(), "QueryPipeline");
+        else
+            header = output.getHeader();
+    }
+
+    processors.insert(processors.end(), pipe.begin(), pipe.end());
+    current_header = std::move(header);
+}
+
 void QueryPipeline::addDelayedStream(ProcessorPtr source)
 {
     checkInitialized();
@@ -119,6 +157,7 @@ void QueryPipeline::concatDelayedStream()
 
 void QueryPipeline::resize(size_t num_streams)
 {
+    checkInitialized();
     concatDelayedStream();
 
     if (num_streams == getNumStreams())

@@ -61,6 +61,7 @@
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/AggregatingTransform.h>
 #include <Processors/Transforms/MergingAggregatedTransform.h>
+#include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
 
 
 namespace DB
@@ -1880,13 +1881,18 @@ void InterpreterSelectQuery::executeMergeAggregated(QueryPipeline & pipeline, bo
     }
     else
     {
-        pipeline.firstStream() = std::make_shared<MergingAggregatedMemoryEfficientBlockInputStream>(pipeline.streams, params, final,
-                                                                                                    max_streams,
-                                                                                                    settings.aggregation_memory_efficient_merge_threads
-                                                                                                    ? static_cast<size_t>(settings.aggregation_memory_efficient_merge_threads)
-                                                                                                    : static_cast<size_t>(settings.max_threads));
+        pipeline.resize(max_streams);
+        auto num_merge_threads = settings.aggregation_memory_efficient_merge_threads
+                                 ? static_cast<size_t>(settings.aggregation_memory_efficient_merge_threads)
+                                 : static_cast<size_t>(settings.max_threads);
 
-        pipeline.streams.resize(1);
+        auto pipe = createMergingAggregatedMemoryEfficientPipe(
+            pipeline.getHeader(),
+            transform_params,
+            pipeline.getNumStreams(),
+            num_merge_threads);
+
+        pipeline.addPipe(std::move(pipe));
     }
 }
 
@@ -1910,6 +1916,18 @@ void InterpreterSelectQuery::executeTotalsAndHaving(Pipeline & pipeline, bool ha
         pipeline.firstStream(), overflow_row, expression,
         has_having ? query.having_expression->getColumnName() : "", settings.totals_mode, settings.totals_auto_threshold, final);
 }
+
+void InterpreterSelectQuery::executeTotalsAndHaving(Pipeline & pipeline, bool has_having, const ExpressionActionsPtr & expression, bool overflow_row, bool final)
+{
+    executeUnion(pipeline);
+
+    const Settings & settings = context.getSettingsRef();
+
+    pipeline.firstStream() = std::make_shared<TotalsHavingBlockInputStream>(
+            pipeline.firstStream(), overflow_row, expression,
+            has_having ? query.having_expression->getColumnName() : "", settings.totals_mode, settings.totals_auto_threshold, final);
+}
+
 
 void InterpreterSelectQuery::executeRollupOrCube(Pipeline & pipeline, Modificator modificator)
 {
