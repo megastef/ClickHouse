@@ -18,6 +18,8 @@ public:
 
     Chunk generate() override;
 
+    BlockInputStreamPtr & getStream() { return stream; }
+
 private:
     bool initialized = false;
     bool finished = false;

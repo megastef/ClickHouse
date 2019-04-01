@@ -1,4 +1,5 @@
 #include <Processors/Transforms/LimitsCheckingTransform.h>
+#include <Interpreters/Quota.h>
 
 namespace DB
 {
@@ -82,6 +83,28 @@ bool LimitsCheckingTransform::checkTimeLimit()
                                   ErrorCodes::TIMEOUT_EXCEEDED);
 
     return true;
+}
+
+void LimitsCheckingTransform::checkQuota(Chunk & chunk)
+{
+    switch (mode)
+    {
+        case LIMITS_TOTAL:
+            /// Checked in `progress` method.
+            break;
+
+        case LIMITS_CURRENT:
+        {
+            time_t current_time = time(nullptr);
+            double total_elapsed = info.total_stopwatch.elapsedSeconds();
+
+            quota->checkAndAddResultRowsBytes(current_time, chunk.getNumRows(), chunk.bytes());
+            quota->checkAndAddExecutionTime(current_time, Poco::Timespan((total_elapsed - prev_elapsed) * 1000000.0));
+
+            prev_elapsed = total_elapsed;
+            break;
+        }
+    }
 }
 
 }

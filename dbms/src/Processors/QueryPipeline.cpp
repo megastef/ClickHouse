@@ -2,12 +2,16 @@
 
 #include <Processors/ResizeProcessor.h>
 #include <Processors/ConcatProcessor.h>
+#include <Processors/NullSink.h>
 #include <Processors/Transforms/TotalsHavingTransform.h>
-
-#include <IO/WriteHelpers.h>
-#include <Common/typeid_cast.h>
 #include <Processors/Transforms/ExtremsTransform.h>
 #include <Processors/Transforms/CreatingSetsTransform.h>
+#include <Processors/Transforms/ConvertingTransform.h>
+
+#include <IO/WriteHelpers.h>
+#include <Interpreters/Context.h>
+#include <Common/typeid_cast.h>
+#include <Processors/Sources/SourceFromInputStream.h>
 
 namespace DB
 {
@@ -249,6 +253,101 @@ void QueryPipeline::addCreatingSetsTransform(ProcessorPtr transform)
     streams = { &concat->getOutputs().front() };
     processors.emplace_back(std::move(transform));
     processors.emplace_back(std::move(concat));
+}
+
+void QueryPipeline::unitePipelines(std::vector<QueryPipeline> && pipelines, const Context & context)
+{
+    checkInitialized();
+    concatDelayedStream();
+
+    std::vector<OutputPort *> extremes;
+
+    for (auto & pipeline : pipelines)
+    {
+        pipeline.checkInitialized();
+        pipeline.concatDelayedStream();
+
+        pipeline.addSimpleTransform([&](const Block & header){
+           return std::make_shared<ConvertingTransform>(
+                   header, current_header, ConvertingTransform::MatchColumnsMode::Position, context);
+        });
+
+        if (pipeline.extremes_port)
+        {
+            auto converting = std::make_shared<ConvertingTransform>(
+                pipeline.current_header, current_header, ConvertingTransform::MatchColumnsMode::Position, context);
+
+            connect(*pipeline.extremes_port, converting->getInputPort());
+            extremes.push_back(&converting->getOutputPort());
+            processors.push_back(std::move(converting));
+        }
+
+        /// Take totals only from first port.
+        if (pipeline.totals_having_port)
+        {
+            if (!has_totals_having)
+            {
+
+                has_totals_having = true;
+                auto converting = std::make_shared<ConvertingTransform>(
+                    pipeline.current_header, current_header, ConvertingTransform::MatchColumnsMode::Position, context);
+
+                connect(*pipeline.extremes_port, converting->getInputPort());
+                totals_having_port = &converting->getOutputPort();
+                processors.push_back(std::move(converting));
+            }
+            else
+            {
+                auto null_sink = std::make_shared<NullSink>(pipeline.totals_having_port->getHeader());
+                connect(*pipeline.totals_having_port, null_sink->getPort());
+                processors.emplace_back(std::move(null_sink));
+            }
+        }
+
+        processors.insert(processors.end(), pipeline.processors.begin(), pipeline.processors.end());
+        streams.insert(streams.end(), pipeline.streams.begin(), pipeline.streams.end());
+    }
+
+    if (!extremes.empty())
+    {
+        has_extremes = true;
+        size_t num_inputs = extremes.size() + (has_extremes ? 1u : 0u);
+
+        if (num_inputs == 1)
+            extremes_port = extremes.front();
+        else
+        {
+            /// Add extra processor for extremes.
+            auto resize = std::make_shared<ResizeProcessor>(current_header, num_inputs, 1);
+            auto input = resize->getInputs().begin();
+
+            if (has_extremes)
+                connect(*extremes_port, *(input++));
+
+            for (auto & output : extremes)
+                connect(*output, *(input++));
+
+            auto transform = std::make_shared<ExtremesTransform>(current_header);
+            extremes_port = &transform->getOutputPort();
+
+            connect(resize->getOutputs().front(), transform->getInputPort());
+            processors.emplace_back(std::move(transform));
+        }
+    }
+}
+
+void QueryPipeline::setProgressCallback(const ProgressCallback & callback)
+{
+    for (auto & processor : processors)
+        if (auto * source = typeid_cast<SourceFromInputStream *>(processor.get()))
+            source->getStream()->setProgressCallback(callback);
+}
+
+void QueryPipeline::setProcessListElement(QueryStatus * elem)
+{
+    for (auto & processor : processors)
+        if (auto * source = typeid_cast<SourceFromInputStream *>(processor.get()))
+            source->getStream()->setProcessListElement(elem);
 }
 
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <Processors/IProcessor.h>
+#include <Interpreters/ProcessList.h>
 
 namespace DB
 {
@@ -7,6 +8,8 @@ namespace DB
 class TableStructureReadLock;
 using TableStructureReadLockPtr = std::shared_ptr<TableStructureReadLock>;
 using TableStructureReadLocks = std::vector<TableStructureReadLockPtr>;
+
+class Context;
 
 class QueryPipeline
 {
@@ -31,12 +34,22 @@ public:
 
     void resize(size_t num_streams);
 
+    void unitePipelines(std::vector<QueryPipeline> && pipelines, const Context & context);
+
     size_t getNumStreams() const { return streams.size(); }
     size_t getNumMainStreams() const { return streams.size() - (has_delayed_stream ? 1 : 0); }
 
     const Block & getHeader() const { return current_header; }
 
     void addTableLock(const TableStructureReadLockPtr & lock) { table_locks.push_back(lock); }
+
+    /// For compatibility with IBlockInputStream.
+    void setProcessListEntry(std::shared_ptr<ProcessListEntry> entry) { process_list_entry = std::move(entry); }
+    void setProgressCallback(const ProgressCallback & callback);
+    void setProcessListElement(QueryStatus * elem);
+
+    std::function<void(IBlockInputStream *, IBlockOutputStream *)>    finish_callback;
+    std::function<void()>                                             exception_callback;
 
 private:
 
@@ -58,6 +71,12 @@ private:
     bool has_delayed_stream = false;
     bool has_totals_having = false;
     bool has_extremes = false;
+
+    /** process_list_entry should be destroyed after in and after out,
+      *  since in and out contain pointer to objects inside process_list_entry (query-level MemoryTracker for example),
+      *  which could be used before destroying of in and out.
+      */
+    std::shared_ptr<ProcessListEntry> process_list_entry;
 
     void checkInitialized();
     void checkSource(const ProcessorPtr & source);

@@ -58,6 +58,8 @@ public:
 
     String getName() const override { return "LimitsCheckingTransform"; }
 
+    void setQuota(QuotaForIntervals & quota_) { quota = &quota_; }
+
 protected:
     void transform(Chunk & chunk) override;
 
@@ -65,6 +67,9 @@ private:
     LocalLimits limits;
     LimitsMode mode = LIMITS_CURRENT;
     QueryStatus * process_list_elem = nullptr;
+
+    QuotaForIntervals * quota = nullptr;
+    double prev_elapsed = 0;
 
     ProcessorProfileInfo info;
 

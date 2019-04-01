@@ -79,7 +79,8 @@ public:
     /// Execute the query and return multuple streams for parallel processing.
     BlockInputStreams executeWithMultipleStreams();
 
-    QueryPipeline executeWithProcessors();
+    QueryPipeline executeWithProcessors() override;
+    bool canExecuteWithProcessors() const override { return true; }
 
     Block getSampleBlock();
 

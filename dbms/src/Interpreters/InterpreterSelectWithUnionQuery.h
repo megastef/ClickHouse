@@ -32,7 +32,8 @@ public:
     /// Execute the query without union of streams.
     BlockInputStreams executeWithMultipleStreams();
 
-    QueryPipeline executeWithProcessors();
+    QueryPipeline executeWithProcessors() override;
+    bool canExecuteWithProcessors() const override { return true; }
 
     Block getSampleBlock();
 
