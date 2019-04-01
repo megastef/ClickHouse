@@ -22,9 +22,12 @@ public:
     void addSimpleTransform(ProcessorGetter getter);
     void addPipe(Processors pipe);
     void addTotalsHavingTransform(ProcessorPtr transform);
+    void addExtremesTransform(ProcessorPtr transform);
+    void addCreatingSetsTransform(ProcessorPtr transform);
 
     /// Will read from this stream after all data was read from other streams.
     void addDelayedStream(ProcessorPtr source);
+    bool hasDelayedStream() const { return has_delayed_stream; }
 
     void resize(size_t num_streams);
 
@@ -43,6 +46,10 @@ private:
     /// Port for each independent "stream".
     std::vector<OutputPort *> streams;
 
+    /// Special ports for extremes and totals having.
+    OutputPort * totals_having_port = nullptr;
+    OutputPort * extremes_port = nullptr;
+
     /// Common header for each stream.
     Block current_header;
 
@@ -50,6 +57,7 @@ private:
 
     bool has_delayed_stream = false;
     bool has_totals_having = false;
+    bool has_extremes = false;
 
     void checkInitialized();
     void checkSource(const ProcessorPtr & source);

@@ -223,6 +223,12 @@ BlockIO InterpreterSelectWithUnionQuery::execute()
 }
 
 
+QueryPipeline executeWithProcessors()
+{
+    
+}
+
+
 void InterpreterSelectWithUnionQuery::ignoreWithTotals()
 {
     for (auto & interpreter : nested_interpreters)

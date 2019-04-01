@@ -212,7 +212,6 @@ private:
     void executeOrder(QueryPipeline & pipeline);
     void executeMergeSorted(QueryPipeline & pipeline);
     void executePreLimit(QueryPipeline & pipeline);
-    void executeUnion(QueryPipeline & pipeline);
     void executeLimitBy(QueryPipeline & pipeline);
     void executeLimit(QueryPipeline & pipeline);
     void executeProjection(QueryPipeline & pipeline, const ExpressionActionsPtr & expression);
@@ -230,6 +229,8 @@ private:
     };
 
     void executeRollupOrCube(Pipeline & pipeline, Modificator modificator);
+
+    void executeRollupOrCube(QueryPipeline & pipeline, Modificator modificator);
 
     /** If there is a SETTINGS section in the SELECT query, then apply settings from it.
       *

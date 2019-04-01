@@ -66,6 +66,14 @@
 #include <Processors/Transforms/PartialSortingTransform.h>
 #include <Processors/Transforms/LimitsCheckingTransform.h>
 #include <Processors/Transforms/MergeSortingTransform.h>
+#include <Processors/Transforms/MergingSortedTransform.h>
+#include <Processors/Transforms/DistinctTransform.h>
+#include <Processors/Transforms/LimitByTransform.h>
+#include <Processors/Transforms/ExtremsTransform.h>
+#include <Processors/Transforms/CreatingSetsTransform.h>
+#include <Processors/Transforms/RollupTransform.h>
+#include <Processors/Transforms/CubeTransform.h>
+#include <Processors/LimitTransform.h>
 
 
 namespace DB
@@ -923,11 +931,11 @@ void InterpreterSelectQuery::executeImpl(QueryPipeline & pipeline, const BlockIn
                 executeExpression(pipeline, expressions.before_order_and_select);
                 executeDistinct(pipeline, true, expressions.selected_columns);
 
-                need_second_distinct_pass = query.distinct && pipeline.hasMoreThanOneStream();
+                need_second_distinct_pass = query.distinct && (pipeline.getNumStreams() > 1);
             }
             else
             {
-                need_second_distinct_pass = query.distinct && pipeline.hasMoreThanOneStream();
+                need_second_distinct_pass = query.distinct && (pipeline.getNumStreams() > 1);
 
                 if (query.group_by_with_totals && !aggregate_final)
                 {
@@ -966,7 +974,7 @@ void InterpreterSelectQuery::executeImpl(QueryPipeline & pipeline, const BlockIn
             /** Optimization - if there are several sources and there is LIMIT, then first apply the preliminary LIMIT,
               * limiting the number of rows in each up to `offset + limit`.
               */
-            if (query.limit_length && pipeline.hasMoreThanOneStream() && !query.distinct && !expressions.has_limit_by && !settings.extremes)
+            if (query.limit_length && (pipeline.getNumStreams() > 1) && !query.distinct && !expressions.has_limit_by && !settings.extremes)
             {
                 executePreLimit(pipeline);
             }
@@ -974,13 +982,13 @@ void InterpreterSelectQuery::executeImpl(QueryPipeline & pipeline, const BlockIn
             if (need_second_distinct_pass
                 || query.limit_length
                 || query.limit_by_expression_list
-                || pipeline.stream_with_non_joined_data)
+                || pipeline.hasDelayedStream())
             {
                 need_merge_streams = true;
             }
 
             if (need_merge_streams)
-                executeUnion(pipeline);
+                pipeline.resize(1);
 
             /** If there was more than one stream,
               * then DISTINCT needs to be performed once again after merging all streams.
@@ -1972,6 +1980,39 @@ void InterpreterSelectQuery::executeRollupOrCube(Pipeline & pipeline, Modificato
         pipeline.firstStream() = std::make_shared<CubeBlockInputStream>(pipeline.firstStream(), params);
 }
 
+void InterpreterSelectQuery::executeRollupOrCube(QueryPipeline & pipeline, Modificator modificator)
+{
+    pipeline.resize(1);
+
+    Names key_names;
+    AggregateDescriptions aggregates;
+    query_analyzer->getAggregateInfo(key_names, aggregates);
+
+    Block header = pipeline.getHeader();
+
+    ColumnNumbers keys;
+
+    for (const auto & name : key_names)
+        keys.push_back(header.getPositionByName(name));
+
+    const Settings & settings = context.getSettingsRef();
+
+    Aggregator::Params params(header, keys, aggregates,
+                              false, settings.max_rows_to_group_by, settings.group_by_overflow_mode,
+                              settings.compile ? &context.getCompiler() : nullptr, settings.min_count_to_compile,
+                              SettingUInt64(0), SettingUInt64(0),
+                              settings.max_bytes_before_external_group_by, settings.empty_result_for_aggregation_by_empty_set,
+                              context.getTemporaryPath(), settings.max_threads);
+
+    pipeline.addSimpleTransform([&](const Block & header) -> ProcessorPtr
+    {
+        if (modificator == Modificator::ROLLUP)
+            return std::make_shared<RollupTransform>(header, params);
+        else
+            return std::make_shared<CubeTransform>(header, params);
+    });
+}
+
 
 void InterpreterSelectQuery::executeExpression(Pipeline & pipeline, const ExpressionActionsPtr & expression)
 {
@@ -2097,12 +2138,40 @@ void InterpreterSelectQuery::executeMergeSorted(Pipeline & pipeline)
     }
 }
 
+void InterpreterSelectQuery::executeMergeSorted(QueryPipeline & pipeline)
+{
+    SortDescription order_descr = getSortDescription(query);
+    UInt64 limit = getLimitForSorting(query, context);
+
+    const Settings & settings = context.getSettingsRef();
+
+    /// If there are several streams, then we merge them into one
+    if (pipeline.getNumStreams() > 1)
+    {
+        auto transform = std::make_shared<MergingSortedTransform>(
+            pipeline.getHeader(),
+            pipeline.getNumStreams(),
+            order_descr,
+            settings.max_block_size, limit);
+
+        pipeline.addPipe({ std::move(transform) });
+    }
+}
+
 
 void InterpreterSelectQuery::executeProjection(Pipeline & pipeline, const ExpressionActionsPtr & expression)
 {
     pipeline.transform([&](auto & stream)
     {
         stream = std::make_shared<ExpressionBlockInputStream>(stream, expression);
+    });
+}
+
+void InterpreterSelectQuery::executeProjection(QueryPipeline & pipeline, const ExpressionActionsPtr & expression)
+{
+    pipeline.addSimpleTransform([&](const Block & header)
+    {
+       return std::make_shared<ExpressionTransform>(header, expression);
     });
 }
 
@@ -2124,6 +2193,28 @@ void InterpreterSelectQuery::executeDistinct(Pipeline & pipeline, bool before_or
         {
             SizeLimits limits(settings.max_rows_in_distinct, settings.max_bytes_in_distinct, settings.distinct_overflow_mode);
             stream = std::make_shared<DistinctBlockInputStream>(stream, limits, limit_for_distinct, columns);
+        });
+    }
+}
+
+void InterpreterSelectQuery::executeDistinct(QueryPipeline & pipeline, bool before_order, Names columns)
+{
+    if (query.distinct)
+    {
+        const Settings & settings = context.getSettingsRef();
+
+        auto [limit_length, limit_offset] = getLimitLengthAndOffset(query, context);
+        UInt64 limit_for_distinct = 0;
+
+        /// If after this stage of DISTINCT ORDER BY is not executed, then you can get no more than limit_length + limit_offset of different rows.
+        if (!query.order_expression_list || !before_order)
+            limit_for_distinct = limit_length + limit_offset;
+
+        SizeLimits limits(settings.max_rows_in_distinct, settings.max_bytes_in_distinct, settings.distinct_overflow_mode);
+
+        pipeline.addSimpleTransform([&](const Block & header) -> ProcessorPtr
+        {
+            return std::make_shared<DistinctTransform>(header, limits, limit_for_distinct, columns);
         });
     }
 }
@@ -2162,6 +2253,20 @@ void InterpreterSelectQuery::executePreLimit(Pipeline & pipeline)
     }
 }
 
+/// Preliminary LIMIT - is used in every source, if there are several sources, before they are combined.
+void InterpreterSelectQuery::executePreLimit(QueryPipeline & pipeline)
+{
+    /// If there is LIMIT
+    if (query.limit_length)
+    {
+        auto [limit_length, limit_offset] = getLimitLengthAndOffset(query, context);
+        pipeline.addSimpleTransform([&, limit = limit_length + limit_offset](const Block & header)
+        {
+            return std::make_shared<LimitTransform>(header, limit, 0, false);
+        });
+    }
+}
+
 
 void InterpreterSelectQuery::executeLimitBy(Pipeline & pipeline)
 {
@@ -2177,6 +2282,23 @@ void InterpreterSelectQuery::executeLimitBy(Pipeline & pipeline)
     pipeline.transform([&](auto & stream)
     {
         stream = std::make_shared<LimitByBlockInputStream>(stream, value, columns);
+    });
+}
+
+void InterpreterSelectQuery::executeLimitBy(QueryPipeline & pipeline)
+{
+    if (!query.limit_by_value || !query.limit_by_expression_list)
+        return;
+
+    Names columns;
+    for (const auto & elem : query.limit_by_expression_list->children)
+        columns.emplace_back(elem->getColumnName());
+
+    UInt64 value = getLimitUIntValue(query.limit_by_value, context);
+
+    pipeline.addSimpleTransform([&](const Block & header)
+    {
+        return std::make_shared<LimitByTransform>(header, value, columns);
     });
 }
 
@@ -2237,6 +2359,39 @@ void InterpreterSelectQuery::executeLimit(Pipeline & pipeline)
     }
 }
 
+void InterpreterSelectQuery::executeLimit(QueryPipeline & pipeline)
+{
+    /// If there is LIMIT
+    if (query.limit_length)
+    {
+        /** Rare case:
+          *  if there is no WITH TOTALS and there is a subquery in FROM, and there is WITH TOTALS on one of the levels,
+          *  then when using LIMIT, you should read the data to the end, rather than cancel the query earlier,
+          *  because if you cancel the query, we will not get `totals` data from the remote server.
+          *
+          * Another case:
+          *  if there is WITH TOTALS and there is no ORDER BY, then read the data to the end,
+          *  otherwise TOTALS is counted according to incomplete data.
+          */
+        bool always_read_till_end = false;
+
+        if (query.group_by_with_totals && !query.order_expression_list)
+            always_read_till_end = true;
+
+        if (!query.group_by_with_totals && hasWithTotalsInAnySubqueryInFromClause(query))
+            always_read_till_end = true;
+
+        UInt64 limit_length;
+        UInt64 limit_offset;
+        std::tie(limit_length, limit_offset) = getLimitLengthAndOffset(query, context);
+
+        pipeline.addSimpleTransform([&](const Block & header)
+        {
+            return std::make_shared<LimitTransform>(header, limit_length, limit_offset, always_read_till_end);
+        });
+    }
+}
+
 
 void InterpreterSelectQuery::executeExtremes(Pipeline & pipeline)
 {
@@ -2249,6 +2404,15 @@ void InterpreterSelectQuery::executeExtremes(Pipeline & pipeline)
     });
 }
 
+void InterpreterSelectQuery::executeExtremes(QueryPipeline & pipeline)
+{
+    if (!context.getSettingsRef().extremes)
+        return;
+
+    auto transform = std::make_shared<ExtremesTransform>(pipeline.getHeader());
+    pipeline.addExtremesTransform(std::move(transform));
+}
+
 
 void InterpreterSelectQuery::executeSubqueriesInSetsAndJoins(Pipeline & pipeline, SubqueriesForSets & subqueries_for_sets)
 {
@@ -2259,6 +2423,18 @@ void InterpreterSelectQuery::executeSubqueriesInSetsAndJoins(Pipeline & pipeline
         pipeline.firstStream(), subqueries_for_sets,
         SizeLimits(settings.max_rows_to_transfer, settings.max_bytes_to_transfer, settings.transfer_overflow_mode));
 }
+
+void InterpreterSelectQuery::executeSubqueriesInSetsAndJoins(QueryPipeline & pipeline, SubqueriesForSets & subqueries_for_sets)
+{
+    const Settings & settings = context.getSettingsRef();
+
+    auto creating_sets = std::make_shared<CreatingSetsTransform>(
+            pipeline.getHeader(), subqueries_for_sets,
+            SizeLimits(settings.max_rows_to_transfer, settings.max_bytes_to_transfer, settings.transfer_overflow_mode));
+
+    pipeline.addCreatingSetsTransform(std::move(creating_sets));
+}
+
 
 void InterpreterSelectQuery::unifyStreams(Pipeline & pipeline)
 {

@@ -6,6 +6,8 @@
 
 #include <IO/WriteHelpers.h>
 #include <Common/typeid_cast.h>
+#include <Processors/Transforms/ExtremsTransform.h>
+#include <Processors/Transforms/CreatingSetsTransform.h>
 
 namespace DB
 {
@@ -194,10 +196,59 @@ void QueryPipeline::addTotalsHavingTransform(ProcessorPtr transform)
     resize(1);
 
     connect(*streams.front(), transform->getInputs().front());
+
     auto & outputs = transform->getOutputs();
-    streams = { &outputs.front(), &outputs.back() };
+
+    streams = { &outputs.front() };
+    totals_having_port = &outputs.back();
+    current_header = outputs.front().getHeader();
     processors.emplace_back(std::move(transform));
 }
 
+void QueryPipeline::addExtremesTransform(ProcessorPtr transform)
+{
+    checkInitialized();
+
+    if (!typeid_cast<const ExtremesTransform *>(transform.get()))
+        throw Exception("ExtremesTransform expected for QueryPipeline::addExtremesTransform.",
+                        ErrorCodes::LOGICAL_ERROR);
+
+    if (has_extremes)
+        throw Exception("Extremes transform was already added to pipeline.", ErrorCodes::LOGICAL_ERROR);
+
+    has_extremes = true;
+
+    if (getNumStreams() != 1)
+        throw Exception("Cant't add Extremes transform because pipeline is expected to have single stream, "
+                        "but it has " + toString(getNumStreams()) + " streams.", ErrorCodes::LOGICAL_ERROR);
+
+    connect(*streams.front(), transform->getInputs().front());
+
+    auto & outputs = transform->getOutputs();
+
+    streams = { &outputs.front() };
+    extremes_port = &outputs.back();
+    current_header = outputs.front().getHeader();
+    processors.emplace_back(std::move(transform));
+}
+
+void QueryPipeline::addCreatingSetsTransform(ProcessorPtr transform)
+{
+    checkInitialized();
+
+    if (!typeid_cast<const CreatingSetsTransform *>(transform.get()))
+        throw Exception("CreatingSetsTransform expected for QueryPipeline::addExtremesTransform.",
+                        ErrorCodes::LOGICAL_ERROR);
+
+    resize(1);
+
+    auto concat = std::make_shared<ConcatProcessor>(current_header, 2);
+    connect(transform->getOutputs().front(), concat->getInputs().front());
+    connect(*streams.back(), concat->getInputs().back());
+
+    streams = { &concat->getOutputs().front() };
+    processors.emplace_back(std::move(transform));
+    processors.emplace_back(std::move(concat));
+}
 
 }
