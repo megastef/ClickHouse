@@ -27,6 +27,7 @@ public:
     void addTotalsHavingTransform(ProcessorPtr transform);
     void addExtremesTransform(ProcessorPtr transform);
     void addCreatingSetsTransform(ProcessorPtr transform);
+    void setOutput(ProcessorPtr output);
 
     /// Will read from this stream after all data was read from other streams.
     void addDelayedStream(ProcessorPtr source);
@@ -35,6 +36,8 @@ public:
     void resize(size_t num_streams);
 
     void unitePipelines(std::vector<QueryPipeline> && pipelines, const Context & context);
+
+    void execute(size_t num_threads);
 
     size_t getNumStreams() const { return streams.size(); }
     size_t getNumMainStreams() const { return streams.size() - (has_delayed_stream ? 1 : 0); }
@@ -71,6 +74,7 @@ private:
     bool has_delayed_stream = false;
     bool has_totals_having = false;
     bool has_extremes = false;
+    bool has_output = false;
 
     /** process_list_entry should be destroyed after in and after out,
       *  since in and out contain pointer to objects inside process_list_entry (query-level MemoryTracker for example),

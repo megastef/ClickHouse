@@ -3,15 +3,18 @@
 #include <Processors/ResizeProcessor.h>
 #include <Processors/ConcatProcessor.h>
 #include <Processors/NullSink.h>
+#include <Processors/Sources/NullSource.h>
 #include <Processors/Transforms/TotalsHavingTransform.h>
 #include <Processors/Transforms/ExtremsTransform.h>
 #include <Processors/Transforms/CreatingSetsTransform.h>
 #include <Processors/Transforms/ConvertingTransform.h>
+#include <Processors/Formats/IOutputFormat.h>
+#include <Processors/Sources/SourceFromInputStream.h>
+#include <Processors/Executors/PipelineExecutor.h>
 
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
 #include <Common/typeid_cast.h>
-#include <Processors/Sources/SourceFromInputStream.h>
 
 namespace DB
 {
@@ -255,6 +258,45 @@ void QueryPipeline::addCreatingSetsTransform(ProcessorPtr transform)
     processors.emplace_back(std::move(concat));
 }
 
+void QueryPipeline::setOutput(ProcessorPtr output)
+{
+    checkInitialized();
+
+    auto * format = typeid_cast<IOutputFormat * >(output.get());
+
+    if (!format)
+        throw Exception("IOutputFormat processor expected for QueryPipeline::setOutput.", ErrorCodes::LOGICAL_ERROR);
+
+    if (has_output)
+        throw Exception("QueryPipeline already has output.", ErrorCodes::LOGICAL_ERROR);
+
+    has_output = true;
+
+    resize(1);
+
+    auto & main = format->getPort(IOutputFormat::PortKind::Main);
+    auto & totals = format->getPort(IOutputFormat::PortKind::Totals);
+    auto & extremes = format->getPort(IOutputFormat::PortKind::Extremes);
+
+    if (!has_totals_having)
+    {
+        auto null_source = std::make_shared<NullSource>(totals.getHeader());
+        totals_having_port = &null_source->getPort();
+        processors.emplace_back(std::move(null_source));
+    }
+
+    if (!has_extremes)
+    {
+        auto null_source = std::make_shared<NullSource>(extremes.getHeader());
+        extremes_port = &null_source->getPort();
+        processors.emplace_back(std::move(null_source));
+    }
+
+    connect(*streams.front(), main);
+    connect(*totals_having_port, totals);
+    connect(*extremes_port, extremes);
+}
+
 void QueryPipeline::unitePipelines(std::vector<QueryPipeline> && pipelines, const Context & context)
 {
     checkInitialized();
@@ -348,6 +390,20 @@ void QueryPipeline::setProcessListElement(QueryStatus * elem)
     for (auto & processor : processors)
         if (auto * source = typeid_cast<SourceFromInputStream *>(processor.get()))
             source->getStream()->setProcessListElement(elem);
+}
+
+
+void QueryPipeline::execute(size_t num_threads)
+{
+    checkInitialized();
+
+    if (!has_output)
+        throw Exception("Cannot execute pipeline because it doesn't have output.", ErrorCodes::LOGICAL_ERROR);
+
+    ThreadPool pool(num_threads, num_threads, num_threads);
+
+    PipelineExecutor executor(processors, &pool);
+    executor.execute();
 }
 
 }

@@ -138,14 +138,13 @@ static void onExceptionBeforeStart(const String & query, Context & context, time
 }
 
 
-static std::tuple<ASTPtr, BlockIO, QueryPipeline> executeQueryImpl(
+static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
     const char * begin,
     const char * end,
     Context & context,
     bool internal,
     QueryProcessingStage::Enum stage,
-    bool has_query_tail,
-    bool use_processors)
+    bool has_query_tail)
 {
     time_t current_time = time(nullptr);
 
@@ -193,7 +192,7 @@ static std::tuple<ASTPtr, BlockIO, QueryPipeline> executeQueryImpl(
     /// Copy query into string. It will be written to log and presented in processlist. If an INSERT query, string will not include data to insertion.
     String query(begin, query_end);
     BlockIO res;
-    QueryPipeline pipeline;
+    QueryPipeline & pipeline = res.pipeline;
 
     try
     {
@@ -236,7 +235,7 @@ static std::tuple<ASTPtr, BlockIO, QueryPipeline> executeQueryImpl(
         context.initializeExternalTablesIfSet();
 
         auto interpreter = InterpreterFactory::get(ast, context, stage);
-        use_processors = use_processors && interpreter->canExecuteWithProcessors();
+        bool use_processors = settings.experimental_use_processors && interpreter->canExecuteWithProcessors();
 
         if (use_processors)
             pipeline = interpreter->executeWithProcessors();
@@ -471,7 +470,7 @@ static std::tuple<ASTPtr, BlockIO, QueryPipeline> executeQueryImpl(
         throw;
     }
 
-    return std::make_tuple(ast, res, pipeline);
+    return std::make_tuple(ast, res);
 }
 
 
@@ -483,22 +482,8 @@ BlockIO executeQuery(
     bool may_have_embedded_data)
 {
     BlockIO streams;
-    QueryPipeline pipeline;
-    std::tie(std::ignore, streams, pipeline) = executeQueryImpl(query.data(), query.data() + query.size(), context, internal, stage, !may_have_embedded_data, false);
+    std::tie(std::ignore, streams) = executeQueryImpl(query.data(), query.data() + query.size(), context, internal, stage, !may_have_embedded_data);
     return streams;
-}
-
-QueryPipeline executeQueryWithProcessors(
-    const String & query,
-    Context & context,
-    bool internal,
-    QueryProcessingStage::Enum stage,
-    bool may_have_embedded_data)
-{
-    BlockIO streams;
-    QueryPipeline pipeline;
-    std::tie(std::ignore, streams, pipeline) = executeQueryImpl(query.data(), query.data() + query.size(), context, internal, stage, !may_have_embedded_data, true);
-    return pipeline;
 }
 
 
@@ -547,11 +532,10 @@ void executeQuery(
 
     ASTPtr ast;
     BlockIO streams;
-    QueryPipeline pipeline;
 
-    bool use_processors = true;
+    std::tie(ast, streams) = executeQueryImpl(begin, end, context, false, QueryProcessingStage::Complete, may_have_tail);
 
-    std::tie(ast, streams, pipeline) = executeQueryImpl(begin, end, context, false, QueryProcessingStage::Complete, may_have_tail, use_processors);
+    auto & pipeline = streams.pipeline;
 
     try
     {
@@ -649,7 +633,7 @@ void executeQuery(
                 set_query_id(context.getClientInfo().current_query_id);
 
             pipeline.setOutput(std::move(out));
-            pipeline.execute();
+            pipeline.execute(context.getSettingsRef().max_threads);
         }
     }
     catch (...)
